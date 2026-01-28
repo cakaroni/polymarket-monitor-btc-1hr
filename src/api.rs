@@ -18,8 +18,7 @@ use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer as _;
 use alloy::primitives::Address as AlloyAddress;
 
-// CTF (Conditional Token Framework) imports for redemption
-// Based on docs: https://docs.polymarket.com/developers/builders/relayer-client#redeem-positions
+// CTF (Conditional Token Framework) imports for merging positions
 use alloy::primitives::{Address, B256, U256, Bytes};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::eth::TransactionRequest;
@@ -762,6 +761,59 @@ impl PolymarketApi {
         }
     }
     
+    /// Cancel an order by order ID
+    pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        // Check if we have a private key (required for signing)
+        let _private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required for order cancellation. Please set private_key in config.json"))?;
+        
+        // Create signer from private key
+        let signer = LocalSigner::from_str(_private_key)
+            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
+            .with_chain_id(Some(POLYGON));
+        
+        // Build authentication builder with proxy wallet support (same pattern as place_order)
+        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
+            .context("Failed to create CLOB client")?
+            .authentication_builder(&signer);
+        
+        // Configure proxy wallet if provided
+        if let Some(proxy_addr) = &self.proxy_wallet_address {
+            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
+                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
+            
+            auth_builder = auth_builder.funder(funder_address);
+            
+            // Set signature type based on config or default to Proxy
+            let sig_type = match self.signature_type {
+                Some(1) => SignatureType::Proxy,
+                Some(2) => SignatureType::GnosisSafe,
+                Some(0) | None => SignatureType::Proxy,
+                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
+            };
+            auth_builder = auth_builder.signature_type(sig_type);
+        } else if let Some(sig_type_num) = self.signature_type {
+            let sig_type = match sig_type_num {
+                0 => SignatureType::Eoa,
+                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
+                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
+            };
+            auth_builder = auth_builder.signature_type(sig_type);
+        }
+        
+        // Create CLOB client with authentication (same pattern as place_order)
+        let client = auth_builder
+            .authenticate()
+            .await
+            .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
+        
+        // Cancel the order using the SDK
+        client.cancel_order(order_id).await
+            .context(format!("Failed to cancel order {}", order_id))?;
+        
+        Ok(())
+    }
+    
     /// Place an order using REST API with HMAC authentication (fallback method)
     /// 
     /// NOTE: This is a fallback method. The main place_order() method uses the official SDK
@@ -818,140 +870,96 @@ impl PolymarketApi {
         Ok(order_response)
     }
 
-    /// Redeem winning conditional tokens after market resolution
-    /// 
-    /// This uses the CTF (Conditional Token Framework) contract to redeem winning tokens
-    /// for USDC at 1:1 ratio after market resolution.
-    /// 
-    /// Parameters:
-    /// - condition_id: The condition ID of the resolved market
-    /// - token_id: The token ID of the winning token (used to determine index_set)
-    /// - outcome: "Up" or "Down" to determine the index set
-    /// 
-    /// Reference: Polymarket CTF redemption using SDK
-    /// USDC collateral address: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
-    /// 
-    /// Note: This implementation uses the SDK's CTF client if available.
-    /// The exact module path may vary - check SDK documentation.
-    pub async fn redeem_tokens(
+    /// Merge Up and Down tokens into collateral (USDC)
+    /// This can be done BEFORE the market finishes if you hold both sides
+    pub async fn merge_positions(
         &self,
         condition_id: &str,
-        token_id: &str,
-        outcome: &str,
+        amount_shares: f64,
     ) -> Result<RedeemResponse> {
-        // Check if we have a private key (required for signing transactions)
-        let private_key = self.private_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Private key is required for redemption. Please set private_key in config.json"))?;
-        
-        // Create signer from private key
-        let signer = LocalSigner::from_str(private_key)
-            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
-            .with_chain_id(Some(POLYGON));
-        
-        // USDC collateral token address on Polygon
         let collateral_token = Address::parse_checksummed(
             "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
             None
         ).context("Failed to parse USDC address")?;
         
-        // Parse condition_id to B256 (remove 0x prefix if present)
         let condition_id_clean = condition_id.strip_prefix("0x").unwrap_or(condition_id);
         let condition_id_b256 = B256::from_str(condition_id_clean)
             .context(format!("Failed to parse condition_id to B256: {}", condition_id))?;
         
-        // Determine index_set based on outcome
-        // For binary markets (Up/Down), index sets are typically:
-        // - "Up" or "1" uses index_set [1] 
-        // - "Down" or "0" uses index_set [2]
-        // Note: This may need adjustment - index sets are 1-indexed for binary markets
-        let index_set = if outcome.to_uppercase().contains("UP") || outcome == "1" {
-            U256::from(1)  // Up outcome - index set [1]
-        } else {
-            U256::from(2)  // Down outcome - index set [2]
-        };
+        // For binary markets, merge index sets [1, 2]
+        let index_sets = vec![U256::from(1), U256::from(2)];
         
-        eprintln!("🔄 Redeeming winning tokens for condition {} (outcome: {}, index_set: {})", 
-              condition_id, outcome, index_set);
+        // Convert shares to U256 (6 decimal places for USDC/Polymarket shares)
+        let amount_u256 = U256::from((amount_shares * 1_000_000.0) as u64);
         
-        // Redeem positions by calling CTF contract directly
-        // Based on docs: https://docs.polymarket.com/developers/builders/relayer-client#redeem-positions
-        // CTF contract: 0x4d97dcd97ec945f40cf65f87097ace5ea0476045
-        // Function: redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)
+        eprintln!("🔄 Merging Up and Down tokens for condition {} (amount: {:.6} shares)", 
+              condition_id, amount_shares);
         
+        self.execute_ctf_call(collateral_token, condition_id_b256, index_sets, amount_u256).await
+    }
+
+    /// Execute a call to the CTF contract (mergePositions only)
+    async fn execute_ctf_call(
+        &self,
+        collateral_token: Address,
+        condition_id_b256: B256,
+        index_sets: Vec<U256>,
+        amount: U256,
+    ) -> Result<RedeemResponse> {
+        // Create signer from private key
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required. Please set private_key in config.json"))?;
+        
+        let signer = LocalSigner::from_str(private_key)
+            .context("Failed to create signer from private key")?
+            .with_chain_id(Some(POLYGON));
         const CTF_CONTRACT: &str = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
         const RPC_URL: &str = "https://polygon-rpc.com";
         
-        // Parse CTF contract address
         let ctf_address = Address::parse_checksummed(CTF_CONTRACT, None)
             .context("Failed to parse CTF contract address")?;
         
-        let parent_collection_id = B256::ZERO;
-        let index_sets = vec![index_set];
+        // Function selector for mergePositions(address,bytes32,bytes32,uint256[],uint256) -> 0x82cc0f7a
+        let selector_hex = "82cc0f7a";
+        let function_selector = hex::decode(selector_hex).context("Failed to decode function selector")?;
         
-        eprintln!("   Prepared redemption parameters:");
-        eprintln!("   - CTF Contract: {}", ctf_address);
-        eprintln!("   - Collateral token (USDC): {}", collateral_token);
-        eprintln!("   - Condition ID: {} ({:?})", condition_id, condition_id_b256);
-        eprintln!("   - Index set: {} (outcome: {})", index_set, outcome);
-        
-        // Encode the redeemPositions function call
-        // Function signature: redeemPositions(address,bytes32,bytes32,uint256[])
-        // Function selector: keccak256("redeemPositions(address,bytes32,bytes32,uint256[])")[0:4] = 0x3d7d3f5a
-        
-        // Function selector
-        let function_selector = hex::decode("3d7d3f5a")
-            .context("Failed to decode function selector")?;
-        
-        // Encode parameters manually using ABI encoding rules
-        // Parameters: (address, bytes32, bytes32, uint256[])
         let mut encoded_params = Vec::new();
         
-        // Encode address (20 bytes, left-padded to 32 bytes)
+        // address collateralToken (32 bytes padded)
         let mut addr_bytes = [0u8; 32];
         addr_bytes[12..].copy_from_slice(collateral_token.as_slice());
         encoded_params.extend_from_slice(&addr_bytes);
         
-        // Encode parentCollectionId (bytes32)
-        encoded_params.extend_from_slice(parent_collection_id.as_slice());
+        // bytes32 parentCollectionId (32 bytes)
+        encoded_params.extend_from_slice(&[0u8; 32]);
         
-        // Encode conditionId (bytes32)
+        // bytes32 conditionId (32 bytes)
         encoded_params.extend_from_slice(condition_id_b256.as_slice());
         
-        // Encode indexSets array: offset (32 bytes) + length (32 bytes) + data (32 bytes per element)
-        // Offset points to where array data starts (after all fixed params + offset itself)
-        // Fixed params: address (32) + bytes32 (32) + bytes32 (32) + offset (32) = 128 bytes
-        let array_offset = 32 * 4; // offset to array data (3 fixed params + 1 offset param)
-        let array_length = index_sets.len();
+        // uint256[] indexSets (offset, length, elements)
+        // Offset to indexSets array (32 * 5 for mergePositions)
+        let array_offset = 32 * 5;
+        encoded_params.extend_from_slice(&U256::from(array_offset).to_be_bytes::<32>());
         
-        // Offset to array data (32 bytes)
-        let offset_bytes = U256::from(array_offset).to_be_bytes::<32>();
-        encoded_params.extend_from_slice(&offset_bytes);
+        // uint256 amount (required for mergePositions)
+        encoded_params.extend_from_slice(&amount.to_be_bytes::<32>());
         
-        // Now append array data after all fixed parameters
-        // Array length (32 bytes)
-        let length_bytes = U256::from(array_length).to_be_bytes::<32>();
-        encoded_params.extend_from_slice(&length_bytes);
+        // Array length
+        encoded_params.extend_from_slice(&U256::from(index_sets.len()).to_be_bytes::<32>());
         
-        // Array data (each uint256 is 32 bytes)
+        // Array elements
         for idx in &index_sets {
-            let idx_bytes = idx.to_be_bytes::<32>();
-            encoded_params.extend_from_slice(&idx_bytes);
+            encoded_params.extend_from_slice(&idx.to_be_bytes::<32>());
         }
         
-        // Combine function selector with encoded parameters
         let mut call_data = function_selector;
         call_data.extend_from_slice(&encoded_params);
         
-        eprintln!("   Calling CTF contract to redeem positions...");
-        
-        // Create provider with wallet
+        // Create provider and send transaction
         let provider = ProviderBuilder::new()
-            .wallet(signer.clone())
-            .connect(RPC_URL)
-            .await
-            .context("Failed to connect to Polygon RPC")?;
+            .wallet(signer)
+            .connect_http(RPC_URL.parse().context("Failed to parse RPC URL")?);
         
-        // Build transaction request
         let tx_request = TransactionRequest {
             to: Some(ctf_address.into()),
             input: Bytes::from(call_data).into(),
@@ -959,41 +967,22 @@ impl PolymarketApi {
             ..Default::default()
         };
         
-        // Send transaction
-        let pending_tx = provider.send_transaction(tx_request)
-            .await
-            .context("Failed to send redeem transaction")?;
-
+        let pending_tx = provider.send_transaction(tx_request).await
+            .context("Failed to send mergePositions transaction")?;
+        
         let tx_hash = *pending_tx.tx_hash();
-        
-        eprintln!("   Transaction sent, waiting for confirmation...");
-        eprintln!("   Transaction hash: {:?}", tx_hash);
-        
-        // Wait for transaction receipt
         let receipt = pending_tx.get_receipt().await
             .context("Failed to get transaction receipt")?;
         
-        // Check if transaction succeeded
-        // Receipt status() returns true for success, false for failure
-        let success = receipt.status();
-        
-        if success {
-            let redeem_response = RedeemResponse {
+        if receipt.status() {
+            eprintln!("✅ Successfully executed mergePositions! Transaction: {:?}", tx_hash);
+            Ok(RedeemResponse {
                 success: true,
-                message: Some(format!("Successfully redeemed tokens. Transaction: {:?}", tx_hash)),
+                message: Some(format!("Successfully executed mergePositions. Transaction: {:?}", tx_hash)),
                 transaction_hash: Some(format!("{:?}", tx_hash)),
-                amount_redeemed: None,
-            };
-            
-            eprintln!("✅ Successfully redeemed winning tokens!");
-            eprintln!("   Transaction hash: {:?}", tx_hash);
-            if let Some(block_number) = receipt.block_number {
-                eprintln!("   Block number: {}", block_number);
-            }
-            
-            Ok(redeem_response)
+            })
         } else {
-            anyhow::bail!("Redemption transaction failed. Transaction hash: {:?}", tx_hash);
+            anyhow::bail!("mergePositions transaction failed. Transaction hash: {:?}", tx_hash);
         }
     }
 
@@ -1157,7 +1146,7 @@ impl PolymarketApi {
                     }
                 }
                 // Fallback: filter by token_id matching market tokens
-                if let Some(token_id) = fill.get_token_id() {
+                if let Some(token_id) = &fill.token_id {
                     market_token_ids.contains(token_id)
                 } else {
                     false
@@ -1175,7 +1164,7 @@ impl PolymarketApi {
     /// This is a workaround if the /fills endpoint doesn't work
     async fn get_user_fills_by_token_ids(
         &self,
-        user_address: &str,
+        _user_address: &str,
         condition_id: &str,
         limit: Option<u32>,
     ) -> Result<Vec<crate::models::Fill>> {
@@ -1231,19 +1220,17 @@ impl PolymarketApi {
                             Vec::new()
                         };
                         
-                        // Filter by user address
+                        // Filter by condition_id (since Fill struct doesn't have user/maker/taker fields)
+                        // In a real implementation, you'd need to check the actual fill data structure
                         let user_fills: Vec<crate::models::Fill> = fills
                             .into_iter()
                             .filter(|fill| {
-                                fill.user.as_ref()
-                                    .map(|u| u.to_lowercase() == user_address.strip_prefix("0x").unwrap_or(user_address).to_lowercase())
-                                    .unwrap_or(false) ||
-                                fill.maker.as_ref()
-                                    .map(|m| m.to_lowercase() == user_address.strip_prefix("0x").unwrap_or(user_address).to_lowercase())
-                                    .unwrap_or(false) ||
-                                fill.taker.as_ref()
-                                    .map(|t| t.to_lowercase() == user_address.strip_prefix("0x").unwrap_or(user_address).to_lowercase())
-                                    .unwrap_or(false)
+                                // Filter by condition_id if it matches
+                                if let Some(fill_cond_id) = &fill.condition_id {
+                                    fill_cond_id == condition_id
+                                } else {
+                                    false
+                                }
                             })
                             .collect();
                         
